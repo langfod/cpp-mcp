@@ -1,9 +1,9 @@
 /**
  * @file mcp_server.h
  * @brief MCP Server implementation
- * 
+ *
  * This file implements the server-side functionality for the Model Context Protocol.
- * Supports protocol versions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25
+ * Supports both 2025-03-26 Streamable HTTP and 2024-11-05 HTTP+SSE transports.
  */
 
 #ifndef MCP_SERVER_H
@@ -12,6 +12,7 @@
 #include "mcp_message.h"
 #include "mcp_resource.h"
 #include "mcp_tool.h"
+#include "mcp_prompt.h"
 #include "mcp_thread_pool.h"
 #include "mcp_logger.h"
 
@@ -23,6 +24,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <functional>
 #include <chrono>
@@ -36,15 +38,14 @@ namespace mcp {
 
 using method_handler = std::function<json(const json&, const std::string&)>;
 using tool_handler = method_handler;
+using prompt_handler = method_handler;
 using notification_handler = std::function<void(const json&, const std::string&)>;
 using auth_handler = std::function<bool(const std::string&, const std::string&)>;
 using session_cleanup_handler = std::function<void(const std::string&)>;
 
 class event_dispatcher {
 public:
-    event_dispatcher() {
-        message_.reserve(128); // Pre-allocate space for messages
-    }
+    event_dispatcher() = default;
     
     ~event_dispatcher() {
         close();
@@ -54,37 +55,35 @@ public:
         if (!sink || closed_.load(std::memory_order_acquire)) {
             return false;
         }
-        
+
         std::string message_copy;
         {
             std::unique_lock<std::mutex> lk(m_);
-            
+
             if (closed_.load(std::memory_order_acquire)) {
                 return false;
             }
-            
-            int id = id_.load(std::memory_order_relaxed);
-            
-            bool result = cv_.wait_for(lk, timeout, [&] { 
-                return cid_.load(std::memory_order_relaxed) == id || closed_.load(std::memory_order_acquire); 
+
+            bool result = cv_.wait_for(lk, timeout, [&] {
+                return !messages_.empty() || closed_.load(std::memory_order_acquire);
             });
-            
+
             if (closed_.load(std::memory_order_acquire)) {
                 return false;
             }
-            
+
             if (!result) {
-                return false;
+                // Idle timeout: keep the SSE stream open (long-running tools may be quiet).
+                return true;
             }
-            
-            // Only copy the message if there is one
-            if (!message_.empty()) {
-                message_copy.swap(message_);
-            } else {
-                return true; // No message but condition satisfied
+
+            if (messages_.empty()) {
+                return true;
             }
+            message_copy = std::move(messages_.front());
+            messages_.pop();
         }
-        
+
         try {
             if (!message_copy.empty()) {
                 if (!sink->write(message_copy.data(), message_copy.size())) {
@@ -99,6 +98,16 @@ public:
         }
     }
 
+    // Returns true when the dispatcher was closed before the timeout elapsed.
+    // close() wakes this wait, so callers can join instead of sleeping.
+    template <typename Rep, typename Period>
+    bool wait_for_close(const std::chrono::duration<Rep, Period>& timeout) {
+        std::unique_lock<std::mutex> lk(m_);
+        return cv_.wait_for(lk, timeout, [this] {
+            return closed_.load(std::memory_order_acquire);
+        });
+    }
+
     bool send_event(const std::string& message) {
         if (closed_.load(std::memory_order_acquire) || message.empty()) {
             return false;
@@ -110,15 +119,16 @@ public:
             if (closed_.load(std::memory_order_acquire)) {
                 return false;
             }
-            
-            // Efficiently set the message and allocate space as needed
-            if (message.size() > message_.capacity()) {
-                message_.reserve(message.size() + 64); // Pre-allocate extra space to avoid frequent reallocations
+
+            static constexpr size_t kMaxQueued = 512;
+            while (messages_.size() >= kMaxQueued) {
+                messages_.pop();
             }
-            message_ = message;
-            
-            cid_.store(id_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-            cv_.notify_one(); // Notify waiting threads
+            messages_.push(message);
+            // Heartbeat threads also wait on cv_. notify_all so a message
+            // cannot be stranded by waking the heartbeat waiter instead of
+            // wait_event().
+            cv_.notify_all();
             return true;
         } catch (...) {
             return false;
@@ -126,12 +136,13 @@ public:
     }
     
     void close() {
-        bool was_closed = closed_.exchange(true, std::memory_order_release);
-        if (was_closed) {
-            return;
-        }
-        
         try {
+            // Set the flag and notify while holding m_ so a waiter cannot
+            // miss the wakeup between its predicate check and wait().
+            std::lock_guard<std::mutex> lk(m_);
+            if (closed_.exchange(true, std::memory_order_release)) {
+                return;
+            }
             cv_.notify_all();
         } catch (...) {
             // Ignore exceptions
@@ -157,9 +168,7 @@ public:
 private:
     mutable std::mutex m_;
     std::condition_variable cv_;
-    std::atomic<int> id_{0};
-    std::atomic<int> cid_{-1};
-    std::string message_;
+    std::queue<std::string> messages_;
     std::atomic<bool> closed_{false};
     std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};
 };
@@ -198,10 +207,19 @@ public:
         /** SSE endpoint path */
         std::string sse_endpoint{ "/sse" };
 
-        /** Message endpoint path */
+        /** Message endpoint path (legacy HTTP+SSE transport) */
         std::string msg_endpoint{ "/message" };
 
+        /** Streamable HTTP endpoint path (2025-03-26 transport) */
+        std::string mcp_endpoint{ "/mcp" };
+
         unsigned int threadpool_size{ std::thread::hardware_concurrency() };
+
+        /** Maximum concurrent sessions (0 = unlimited) */
+        unsigned int max_sessions{ MCP_MAX_SESSIONS };
+
+        /** Inactive session timeout in seconds (0 = disabled) */
+        unsigned int session_timeout{ MCP_SESSION_TIMEOUT };
 
         #ifdef MCP_SSL        
         /**
@@ -232,11 +250,18 @@ public:
     ~server();
     
     /**
-     * @brief Start the server
-     * @param blocking If true, this call blocks until the server stops
+     * @brief Start the server (HTTP/SSE)
+     * @param blocking Whether to block the current thread
      * @return True if the server started successfully
      */
     bool start(bool blocking = true);
+    
+    /**
+     * @brief Start the server using stdio transport
+     * Reads JSON-RPC messages from stdin and writes responses to stdout.
+     * Blocks the current thread until stdin is closed.
+     */
+    void start_stdio();
     
     /**
      * @brief Stop the server
@@ -261,7 +286,13 @@ public:
      * @param capabilities The capabilities of the server
      */
     void set_capabilities(const json& capabilities);
-    
+
+    /**
+     * @brief Set server instructions (returned in initialize response)
+     * @param instructions Human-readable instructions for the client
+     */
+    void set_instructions(const std::string& instructions);
+
     /**
      * @brief Register a method handler
      * @param method The method name
@@ -282,13 +313,40 @@ public:
      * @param resource The resource to register
      */
     void register_resource(const std::string& path, std::shared_ptr<resource> resource);
-    
+
+    /**
+     * @brief Register a resource template (2025-03-26 spec)
+     * @param uri_template RFC 6570 URI template (e.g. "myapp://items/{id}")
+     * @param name Human-readable name
+     * @param mime_type MIME type of the resource
+     * @param description Description of the template
+     * @param handler Function called with (uri, uriParams, session_id) to produce content
+     */
+    using resource_template_handler = std::function<json(
+        const std::string& uri,
+        const std::map<std::string, std::string>& uri_params,
+        const std::string& session_id)>;
+
+    void register_resource_template(
+        const std::string& uri_template,
+        const std::string& name,
+        const std::string& mime_type,
+        const std::string& description,
+        resource_template_handler handler);
+
     /**
      * @brief Register a tool
      * @param tool The tool to register
      * @param handler The function to call when the tool is invoked
      */
     void register_tool(const tool& tool, tool_handler handler);
+
+    /**
+     * @brief Register a prompt
+     * @param prompt The prompt to register
+     * @param handler The function to call when the prompt is invoked
+     */
+    void register_prompt(const prompt& prompt, prompt_handler handler);
 
     /**
      * @brief Register a session cleanup handler
@@ -328,6 +386,18 @@ public:
     void send_request(const std::string& session_id, const request& req);
 
     /**
+     * @brief Broadcast a notification to all connected, initialized sessions
+     * @param notification The notification to send (must be a JSON-RPC notification, i.e. no id)
+     */
+    void broadcast_notification(const request& notification);
+
+    /**
+     * @brief Get list of active session IDs
+     * @return Vector of session IDs for connected, initialized clients
+     */
+    std::vector<std::string> get_active_sessions() const;
+
+    /**
      * @brief Set mount point for server
      * @param mount_point The mount point to set
      * @param dir The directory to serve from the mount point
@@ -342,7 +412,8 @@ private:
     std::string name_;
     std::string version_;
     json capabilities_;
-    
+    std::string instructions_;
+
     // The HTTP server
     std::unique_ptr<httplib::Server> http_server_;
     
@@ -352,15 +423,24 @@ private:
     // SSE thread
     std::map<std::string, std::unique_ptr<std::thread>> sse_threads_;
 
+    // Heartbeat threads that have entered their thread function and not yet
+    // exited. stop() waits for this to drain so a thread that already detached
+    // itself cannot touch the server after stop() returns.
+    std::atomic<int> active_sse_threads_{0};
+    std::mutex sse_done_mutex_;
+    std::condition_variable sse_done_cv_;
+    std::atomic<bool> stop_in_progress_{false};
+
     // Event dispatcher for server-sent events
     event_dispatcher sse_dispatcher_;
     
     // Session-specific event dispatchers
     std::map<std::string, std::shared_ptr<event_dispatcher>> session_dispatchers_;
 
-    // Server-sent events endpoint
+    // Endpoint paths
     std::string sse_endpoint_;
     std::string msg_endpoint_;
+    std::string mcp_endpoint_;
     
     // Method handlers
     std::map<std::string, method_handler> method_handlers_;
@@ -370,9 +450,20 @@ private:
     
     // Resources map (path -> resource)
     std::map<std::string, std::shared_ptr<resource>> resources_;
-    
+
+    // Resource templates (2025-03-26 spec)
+    struct resource_template_entry {
+        std::string uri_template;
+        std::string name;
+        std::string mime_type;
+        std::string description;
+        resource_template_handler handler;
+    };
+    std::vector<resource_template_entry> resource_templates_;
+
     // Tools map (name -> handler)
     std::map<std::string, std::pair<tool, tool_handler>> tools_;
+    std::map<std::string, std::pair<prompt, prompt_handler>> prompts_;
     
     // Authentication handler
     auth_handler auth_handler_;
@@ -380,8 +471,15 @@ private:
     // Mutex for thread safety
     mutable std::mutex mutex_;
     
-    // Running flag
-    bool running_ = false;
+    // Running flag. Touched from the accept thread and from callers of
+    // start()/stop(), so it must be atomic.
+    std::atomic<bool> running_{false};
+
+    // Max sessions limit
+    unsigned int max_sessions_ = MCP_MAX_SESSIONS;
+
+    // Inactive session timeout
+    unsigned int session_timeout_ = MCP_SESSION_TIMEOUT;
     
     // Thread pool for async method handlers
     thread_pool thread_pool_;
@@ -389,11 +487,17 @@ private:
     // Map to track session initialization status (session_id -> initialized)
     std::map<std::string, bool> session_initialized_;
 
-    // Handle SSE requests
+    // Legacy HTTP+SSE transport (2024-11-05)
     void handle_sse(const httplib::Request& req, httplib::Response& res);
-    
-    // Handle incoming JSON-RPC requests
     void handle_jsonrpc(const httplib::Request& req, httplib::Response& res);
+
+    // Streamable HTTP transport (2025-03-26)
+    void handle_mcp_post(const httplib::Request& req, httplib::Response& res);
+    void handle_mcp_get(const httplib::Request& req, httplib::Response& res);
+    void handle_mcp_delete(const httplib::Request& req, httplib::Response& res);
+
+    // Parse a single JSON-RPC message from JSON. Moves `params` out of `j`.
+    request parse_jsonrpc_message(json& j) const;
 
     // Send a JSON-RPC message to a client
     void send_jsonrpc(const std::string& session_id, const json& message);
@@ -449,6 +553,14 @@ private:
 
     // Close session
     void close_session(const std::string& session_id);
+
+    // Run the registered cleanup handlers outside the server mutex.
+    void invoke_session_cleanup(
+        const std::string& session_id,
+        const std::map<std::string, session_cleanup_handler>& handlers);
+
+    // Detach the calling heartbeat thread if it is still owned by the map.
+    void release_sse_thread(const std::string& session_id);
 };
 
 } // namespace mcp

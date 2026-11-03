@@ -1,9 +1,9 @@
 /**
  * @file mcp_message.h
  * @brief Core definitions for the Model Context Protocol (MCP) framework
- * 
+ *
  * This file contains the core structures and definitions for the MCP protocol.
- * Supports protocol versions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25
+ * Implements the 2025-03-26 protocol specification.
  */
 
 #ifndef MCP_MESSAGE_H
@@ -24,18 +24,56 @@ namespace mcp {
 // Use the nlohmann json library
 using json = nlohmann::ordered_json;
 
-// MCP version - the latest version this server supports
-constexpr const char* MCP_VERSION = "2025-11-25";
+// MCP version
+constexpr const char* MCP_VERSION = "2025-03-26";
 
-// All protocol versions this server supports (for version negotiation)
-// Servers should support older versions for backward compatibility
-constexpr const char* SUPPORTED_PROTOCOL_VERSIONS[] = {
-    "2025-11-25",  // Latest
-    "2025-06-18",
-    "2025-03-26",
-    "2024-11-05"   // Original stable version
+// Peer JSON limits. These match the official Ruby MCP SDK
+// (MCP::Server::Transports::StreamableHTTPTransport):
+//   MAX_JSON_NESTING = 64
+//   DEFAULT_MAX_REQUEST_BYTES / stdio max_line_bytes = 4 MiB
+// RFC 8259 section 9 allows an implementation to cap nesting depth. MCP itself
+// does not set one; the TypeScript SDK uses the same 4 MiB body default.
+inline constexpr int kMaxJsonNesting = 64;
+inline constexpr std::size_t kMaxRequestBytes = 4u * 1024u * 1024u;
+
+// Thrown when a peer message is larger than kMaxRequestBytes. Callers map this
+// to JSON-RPC invalid request (-32600) and, on HTTP, status 413.
+class peer_json_too_large : public std::runtime_error {
+public:
+    peer_json_too_large()
+        : std::runtime_error("Payload too large") {}
 };
-constexpr size_t SUPPORTED_PROTOCOL_VERSIONS_COUNT = sizeof(SUPPORTED_PROTOCOL_VERSIONS) / sizeof(SUPPORTED_PROTOCOL_VERSIONS[0]);
+
+// Thrown when a peer message is nested deeper than kMaxJsonNesting. Callers map
+// this to JSON-RPC parse error (-32700) and, on HTTP, status 400.
+class peer_json_too_deep : public std::runtime_error {
+public:
+    peer_json_too_deep()
+        : std::runtime_error("JSON nested too deeply") {}
+};
+
+// Parse JSON that arrived from a peer. Rejects inputs larger than
+// kMaxRequestBytes before parsing, and aborts once nesting would exceed
+// kMaxJsonNesting so a deeply nested document cannot exhaust the stack.
+//
+// nlohmann's parser callback reports how many containers are already open.
+// A start event at depth == kMaxJsonNesting would open one more, which is
+// deeper than the Ruby SDK's max_nesting of 64.
+inline json parse_peer_json(const std::string& input) {
+    if (input.size() > kMaxRequestBytes) {
+        throw peer_json_too_large();
+    }
+
+    return json::parse(input, [](int depth, json::parse_event_t event, json&) {
+        if (depth > kMaxJsonNesting ||
+            (depth == kMaxJsonNesting &&
+             (event == json::parse_event_t::array_start ||
+              event == json::parse_event_t::object_start))) {
+            throw peer_json_too_deep();
+        }
+        return true;
+    });
+}
 
 // MCP error codes (JSON-RPC 2.0 standard codes)
 enum class error_code {
@@ -122,10 +160,10 @@ struct request {
 
     static request from_json(const json& j) {
         request req;
-        req.jsonrpc = j["jsonrpc"].get<std::string>();
-        req.id = j["id"];
-        req.method = j["method"].get<std::string>();
-        req.params = j["params"];
+        req.jsonrpc = j.value("jsonrpc", "2.0");
+        req.id = j.contains("id") ? j["id"] : json(nullptr);
+        req.method = j.value("method", "");
+        req.params = j.contains("params") ? j["params"] : json::object();
         return req;
     }
     
@@ -133,7 +171,7 @@ private:
     // Generate a unique ID
     static json generate_id() {
         static int next_id = 1;
-        return next_id++;
+        return json(next_id++);  // Explicitly create json to ensure type consistency
     }
 };
 
@@ -193,10 +231,10 @@ struct response {
 
     static response from_json(const json& j) {
         response res;
-        res.jsonrpc = j["jsonrpc"].get<std::string>();
-        res.id = j["id"];
-        res.result = j["result"];
-        res.error = j["error"];
+        res.jsonrpc = j.value("jsonrpc", "2.0");
+        res.id = j.contains("id") ? j["id"] : json(nullptr);
+        if (j.contains("result")) res.result = j["result"];
+        if (j.contains("error")) res.error = j["error"];
         return res;
     }
 };

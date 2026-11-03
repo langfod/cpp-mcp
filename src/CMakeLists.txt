@@ -16,7 +16,16 @@ add_library(${TARGET} STATIC
     ../include/mcp_sse_client.h
 )
 
-target_link_libraries(${TARGET} PUBLIC ${CMAKE_THREAD_LIBS_INIT} nlohmann_json::nlohmann_json)
+target_compile_definitions(${TARGET} PUBLIC
+    MCP_MAX_SESSIONS=${MCP_MAX_SESSIONS}
+    MCP_SESSION_TIMEOUT=${MCP_SESSION_TIMEOUT}
+)
+
+target_link_libraries(${TARGET} PUBLIC ${CMAKE_THREAD_LIBS_INIT} nlohmann_json::nlohmann_json httplib::httplib)
+
+if(WIN32)
+    target_link_libraries(${TARGET} PUBLIC ws2_32 wsock32)
+endif()
 
 # If OpenSSL is found, link the OpenSSL libraries
 if(OPENSSL_FOUND)

@@ -45,7 +45,7 @@ void sse_client::init_client(const std::string& scheme_host_port, bool validate_
 
 bool sse_client::initialize(const std::string& client_name, const std::string& client_version) {
     LOG_INFO("Initializing MCP client...");
-    
+
     request req = request::create("initialize", {
         {"protocolVersion", MCP_VERSION},
         {"capabilities", capabilities_},
@@ -263,17 +263,17 @@ void sse_client::open_sse_connection() {
                 LOG_INFO("SSE thread: Attempting to connect to ", sse_endpoint_);
                 
                 std::string buffer;
-                auto res = sse_client_->Get(sse_endpoint_, 
+                auto res = sse_client_->Get(sse_endpoint_,
                     [&,this](const char *data, size_t data_length) {
                         buffer.append(data, data_length);
-                        
+
                         // Normalize CRLF to LF
                         size_t crlf_pos = buffer.find("\r\n");
                         while (crlf_pos != std::string::npos) {
                             buffer.replace(crlf_pos, 2, "\n");
                             crlf_pos = buffer.find("\r\n", crlf_pos + 1);
                         }
-                        
+
                         // Process complete events in buffer
                         size_t start_pos = 0;
                         while ((start_pos = buffer.find("\n\n", start_pos)) != std::string::npos) {
@@ -281,12 +281,12 @@ void sse_client::open_sse_connection() {
                             std::string event = buffer.substr(0, start_pos);
                             buffer.erase(0, end_pos);
                             start_pos = 0;
-                            
+
                             if (!parse_sse_data(event.data(), event.size())) {
                                 LOG_ERROR("SSE thread: Failed to parse event");
                             }
                         }
-                        
+
                         return sse_running_.load();
                     });
                 
@@ -373,13 +373,14 @@ bool sse_client::parse_sse_data(const char* data, size_t length) {
             return true;
         } else if (event_type == "message") {
             try {
-                json response = json::parse(data_content);
-                
+                json response = parse_peer_json(data_content);
+
                 if (response.contains("jsonrpc") && response.contains("id") && !response["id"].is_null()) {
-                    json id = response["id"];
-                    
+                    // Use the same serialization method as when storing the request ID
+                    std::string id_key = response["id"].dump();
+
                     std::lock_guard<std::mutex> lock(response_mutex_);
-                    auto it = pending_requests_.find(id);
+                    auto it = pending_requests_.find(id_key);
                     if (it != pending_requests_.end()) {
                         if (response.contains("result")) {
                             it->second.set_value(response["result"]);
@@ -392,15 +393,15 @@ bool sse_client::parse_sse_data(const char* data, size_t length) {
                         } else {
                             it->second.set_value(json::object());
                         }
-                        
+
                         pending_requests_.erase(it);
                     } else {
-                        LOG_WARNING("Received response for unknown request ID: ", id);
+                        LOG_WARNING("Received response for unknown request ID: ", id_key);
                     }
                 } else {
                     LOG_WARNING("Received invalid JSON-RPC response: ", response.dump());
                 }
-            } catch (const json::exception& e) {
+            } catch (const std::exception& e) {
                 LOG_ERROR("Failed to parse JSON-RPC response: ", e.what());
             }
             return true;
@@ -471,6 +472,7 @@ json sse_client::send_jsonrpc(const request& req) {
     
     httplib::Headers headers;
     headers.emplace("Content-Type", "application/json");
+    headers.emplace("Accept", "application/json, text/event-stream");
     
     for (const auto& [key, value] : default_headers_) {
         headers.emplace(key, value);
@@ -491,10 +493,14 @@ json sse_client::send_jsonrpc(const request& req) {
     
     std::promise<json> response_promise;
     std::future<json> response_future = response_promise.get_future();
-    
+
+    // Use the JSON-serialized id as key to ensure type consistency
+    json req_id_json = req.to_json()["id"];
+    std::string req_id_key = req_id_json.dump();
+
     {
         std::lock_guard<std::mutex> response_lock(response_mutex_);
-        pending_requests_[req.id] = std::move(response_promise);
+        pending_requests_[req_id_key] = std::move(response_promise);
     }
     
     auto result = http_client_->Post(msg_endpoint_, headers, req_body, "application/json");
@@ -505,7 +511,7 @@ json sse_client::send_jsonrpc(const request& req) {
         
         {
             std::lock_guard<std::mutex> response_lock(response_mutex_);
-            pending_requests_.erase(req.id);
+            pending_requests_.erase(req_id_key);
         }
         
         LOG_ERROR("JSON-RPC request failed: ", error_msg);
@@ -514,11 +520,11 @@ json sse_client::send_jsonrpc(const request& req) {
     
     if (result->status / 100 != 2) {
         try {
-            json res_json = json::parse(result->body);
+            json res_json = parse_peer_json(result->body);
             
             {
                 std::lock_guard<std::mutex> response_lock(response_mutex_);
-                pending_requests_.erase(req.id);
+                pending_requests_.erase(req_id_key);
             }
             
             if (res_json.contains("error")) {
@@ -533,10 +539,12 @@ json sse_client::send_jsonrpc(const request& req) {
             } else {
                 return json::object();
             }
-        } catch (const json::exception& e) {
+        } catch (const mcp_exception&) {
+            throw;
+        } catch (const std::exception& e) {
             {
                 std::lock_guard<std::mutex> response_lock(response_mutex_);
-                pending_requests_.erase(req.id);
+                pending_requests_.erase(req_id_key);
             }
             
             throw mcp_exception(error_code::parse_error, 
@@ -564,7 +572,7 @@ json sse_client::send_jsonrpc(const request& req) {
         } else {
             {
                 std::lock_guard<std::mutex> response_lock(response_mutex_);
-                pending_requests_.erase(req.id);
+                pending_requests_.erase(req_id_key);
             }
             
             throw mcp_exception(error_code::internal_error, "Timeout waiting for SSE response");
